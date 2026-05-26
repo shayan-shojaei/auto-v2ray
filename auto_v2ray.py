@@ -363,7 +363,11 @@ def _wait_port(host: str, port: int, timeout: float = 2.5) -> bool:
     return False
 
 
+_first_singbox_error_printed = False
+
+
 def http_latency(cfg: dict) -> float | None:
+    global _first_singbox_error_printed
     port = random.randint(*TEST_PORT_RANGE)
     tmpf = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
     json.dump(build_config(cfg, listen="127.0.0.1", port=port), tmpf)
@@ -374,11 +378,17 @@ def http_latency(cfg: dict) -> float | None:
         proc = subprocess.Popen(
             [str(SINGBOX_BIN), "run", "-c", tmpf.name],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
         _active_test_procs.append(proc)
 
         if not _wait_port("127.0.0.1", port):
+            # If sing-box already exited, surface its stderr once for diagnosis
+            if not _first_singbox_error_printed and proc.poll() is not None:
+                _first_singbox_error_printed = True
+                err = proc.stderr.read().decode("utf-8", errors="replace").strip()
+                if err:
+                    print(f"\n[sing-box crash] {err}\n")
             return None
 
         t0 = time.monotonic()
