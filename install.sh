@@ -86,13 +86,24 @@ case "$ARCH" in
 esac
 
 if [ ! -f "$SINGBOX_DIR/sing-box" ]; then
-  RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest")
+  RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest") \
+    || die "Failed to fetch sing-box release info from GitHub"
+
+  # Detect API errors (rate limit, etc.) before trying to parse
+  if echo "$RELEASE_JSON" | grep -q '"message"'; then
+    API_MSG=$(echo "$RELEASE_JSON" | grep '"message"' | head -1 \
+      | sed 's/.*"message": *"\([^"]*\)".*/\1/')
+    die "GitHub API error: $API_MSG"
+  fi
+
   VERSION=$(echo "$RELEASE_JSON" | grep '"tag_name"' | head -1 \
-    | sed 's/.*"tag_name": *"v*\([^"]*\)".*/\1/')
+    | sed 's/.*"tag_name": *"v*\([^"]*\)".*/\1/' || true)
+  [ -z "$VERSION" ] && die "Could not parse sing-box version from GitHub API response"
+
   ASSET="sing-box-${VERSION}-${OS}-${ARCH}.tar.gz"
   DOWNLOAD_URL=$(echo "$RELEASE_JSON" | grep "browser_download_url" \
     | grep "\"${ASSET}\"" | head -1 \
-    | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/')
+    | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/' || true)
 
   [ -z "$DOWNLOAD_URL" ] && die "Could not find sing-box release asset: $ASSET"
 
