@@ -102,7 +102,7 @@ if [ ! -f "$SINGBOX_DIR/sing-box" ]; then
 
   ASSET="sing-box-${VERSION}-${OS}-${ARCH}.tar.gz"
   DOWNLOAD_URL=$(echo "$RELEASE_JSON" | grep "browser_download_url" \
-    | grep "\"${ASSET}\"" | head -1 \
+    | grep "${ASSET}" | head -1 \
     | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/' || true)
 
   [ -z "$DOWNLOAD_URL" ] && die "Could not find sing-box release asset: $ASSET"
@@ -113,6 +113,8 @@ if [ ! -f "$SINGBOX_DIR/sing-box" ]; then
     --strip-components=1 "sing-box-${VERSION}-${OS}-${ARCH}/sing-box"
   chmod +x "$SINGBOX_DIR/sing-box"
   rm -f "$SINGBOX_DIR/$ASSET"
+  # Remove macOS quarantine so the binary can be executed by subprocesses
+  xattr -d com.apple.quarantine "$SINGBOX_DIR/sing-box" 2>/dev/null || true
   green "  sing-box installed at $SINGBOX_DIR/sing-box"
 else
   green "  sing-box already present at $SINGBOX_DIR/sing-box"

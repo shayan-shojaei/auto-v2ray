@@ -100,12 +100,24 @@ def _download_singbox():
 
     SINGBOX_BIN.chmod(0o755)
     archive_path.unlink(missing_ok=True)
+    _strip_quarantine(SINGBOX_BIN)
     print(f"sing-box installed at {SINGBOX_BIN}")
+
+
+def _strip_quarantine(path: Path) -> None:
+    """Remove macOS quarantine xattr so the binary can run in subprocesses."""
+    if platform.system() == "Darwin":
+        subprocess.run(
+            ["xattr", "-d", "com.apple.quarantine", str(path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
 
 
 def ensure_singbox():
     if not SINGBOX_BIN.exists():
         _download_singbox()
+    else:
+        _strip_quarantine(SINGBOX_BIN)
 
 
 def _load_cache(sub_url: str) -> tuple[dict, int] | None:
