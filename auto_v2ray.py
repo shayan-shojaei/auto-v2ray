@@ -436,8 +436,10 @@ def main():
                         help="vmess subscription URL (default: built-in free list)")
     parser.add_argument("--port", type=int, default=1080, metavar="PORT",
                         help="SOCKS5 listen port (default: 1080)")
-    parser.add_argument("--top", type=int, default=10, metavar="N",
-                        help="configs to HTTP-test after TCP filter (default: 10)")
+    parser.add_argument("--top", type=int, default=None, metavar="N",
+                        help="max configs to HTTP-test (default: unlimited)")
+    parser.add_argument("--min-working", type=int, default=3, metavar="K",
+                        help="stop HTTP-testing once this many working proxies found (default: 3)")
     args = parser.parse_args()
 
     ensure_singbox()
@@ -484,30 +486,42 @@ def main():
                     tcp_results.append((lat, futs[fut]))
 
         tcp_results.sort(key=lambda x: x[0])
-        top_n = max(args.top, 15)
-        candidates = [cfg for _, cfg in tcp_results[:top_n]]
 
-        if not candidates:
+        all_candidates = [cfg for _, cfg in tcp_results]
+        if not all_candidates:
             print("All servers unreachable. Check your network connection.")
             sys.exit(1)
 
-        print(f"{len(tcp_results)}/{len(configs)} servers reachable. HTTP-testing top {len(candidates)}...")
+        min_working = args.min_working
+        max_tested = args.top  # None means no cap
+        batch_size = 5
+        http_results: list = []
+        tested = 0
+
+        print(f"{len(tcp_results)}/{len(configs)} servers reachable. "
+              f"HTTP-testing in batches of {batch_size} until {min_working} working found...")
 
         # ---- HTTP test via sing-box ----
-        http_results: list = []
-        done = 0
-        with ThreadPoolExecutor(max_workers=5) as ex:
-            futs = {ex.submit(http_latency, cfg): cfg for cfg in candidates}
-            for fut in as_completed(futs):
-                cfg = futs[fut]
-                lat = fut.result()
-                done += 1
-                tag = f"{cfg['server']}:{cfg['port']}"
-                if lat is not None:
-                    http_results.append((lat, cfg))
-                    print(f"  [{done:2d}/{len(candidates)}] {tag:<40} {int(lat * 1000)}ms")
-                else:
-                    print(f"  [{done:2d}/{len(candidates)}] {tag:<40} failed")
+        for batch_start in range(0, len(all_candidates), batch_size):
+            if len(http_results) >= min_working:
+                break
+            if max_tested is not None and tested >= max_tested:
+                break
+            batch = all_candidates[batch_start:batch_start + batch_size]
+            if max_tested is not None:
+                batch = batch[:max_tested - tested]
+            with ThreadPoolExecutor(max_workers=len(batch)) as ex:
+                futs = {ex.submit(http_latency, cfg): cfg for cfg in batch}
+                for fut in as_completed(futs):
+                    cfg = futs[fut]
+                    lat = fut.result()
+                    tested += 1
+                    tag = f"{cfg['server']}:{cfg['port']}"
+                    if lat is not None:
+                        http_results.append((lat, cfg))
+                        print(f"  [{tested:3d}] {tag:<40} {int(lat * 1000)}ms ✓")
+                    else:
+                        print(f"  [{tested:3d}] {tag:<40} failed")
 
         if not http_results:
             print("\nNo configs passed the HTTP test. The subscription may be stale.")
@@ -515,17 +529,28 @@ def main():
 
         http_results.sort(key=lambda x: x[0])
         best_lat, best = http_results[0]
-        print(f"\n✓ Best: {best['name']}  ({best['server']}:{best['port']})  {int(best_lat * 1000)}ms")
+        print(f"\n✓ Best of {len(http_results)} working: {best['name']}  "
+              f"({best['server']}:{best['port']})  {int(best_lat * 1000)}ms")
         _save_cache(args.sub, best)
 
     # ---- Start production proxy ----
     cfg_path = SINGBOX_DIR / "config.json"
     cfg_path.write_text(json.dumps(build_config(best, listen="0.0.0.0", port=args.port), indent=2))
 
+    # Validate config before starting
+    check = subprocess.run(
+        [str(SINGBOX_BIN), "check", "-c", str(cfg_path)],
+        capture_output=True, text=True,
+    )
+    if check.returncode != 0:
+        print("sing-box config validation failed:")
+        print(check.stderr or check.stdout)
+        sys.exit(1)
+
     proc = subprocess.Popen(
         [str(SINGBOX_BIN), "run", "-c", str(cfg_path)],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
 
     _stop_called = False
@@ -559,17 +584,29 @@ def main():
     lan_ip = get_lan_ip()
     local_url = f"socks5://127.0.0.1:{args.port}"
     lan_url = f"socks5://{lan_ip}:{args.port}"
+    remark = urllib.parse.quote(best.get("name", "auto-v2ray"), safe="")
+    lan_qr_url = f"socks://{lan_ip}:{args.port}#{remark}"
 
     print(f"\n  Local:  {local_url}")
     print(f"  LAN:    {lan_url}")
 
-    print_qr_pair("  Local proxy", local_url, "  LAN proxy", lan_url)
+    print(f"\n  LAN proxy")
+    for l in _qr_lines(lan_qr_url):
+        print(f"  {l}")
 
     print("\nPress Ctrl+C to stop.\n")
 
     while True:
         if proc.poll() is not None:
+            stderr_output = ""
+            try:
+                stderr_output = proc.stderr.read().decode("utf-8", errors="replace").strip()
+            except Exception:
+                pass
             print("sing-box exited unexpectedly.")
+            if stderr_output:
+                print("sing-box error output:")
+                print(stderr_output)
             sys.exit(1)
         time.sleep(1)
 
