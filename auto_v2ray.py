@@ -46,6 +46,8 @@ TEST_URL = "http://www.gstatic.com/generate_204"
 TCP_TIMEOUT = 2.0
 HTTP_TIMEOUT = 6
 TEST_PORT_RANGE = (20000, 29999)
+CACHE_FILE = SINGBOX_DIR / "cache.json"
+CACHE_TTL = 300  # 5 minutes
 
 # ---------------------------------------------------------------------------
 # sing-box download / bootstrap
@@ -104,6 +106,29 @@ def _download_singbox():
 def ensure_singbox():
     if not SINGBOX_BIN.exists():
         _download_singbox()
+
+
+def _load_cache(sub_url: str) -> tuple[dict, int] | None:
+    try:
+        data = json.loads(CACHE_FILE.read_text())
+        age = int(time.time() - data.get("timestamp", 0))
+        if data.get("sub_url") == sub_url and age < CACHE_TTL and data.get("config"):
+            return data["config"], age
+    except Exception:
+        pass
+    return None
+
+
+def _save_cache(sub_url: str, cfg: dict) -> None:
+    try:
+        SINGBOX_DIR.mkdir(parents=True, exist_ok=True)
+        CACHE_FILE.write_text(json.dumps({
+            "sub_url": sub_url,
+            "timestamp": time.time(),
+            "config": cfg,
+        }))
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # vmess:// URL parsing
@@ -438,50 +463,60 @@ def main():
         print("No valid vmess:// configs found in subscription.")
         sys.exit(1)
 
-    print(f"Found {len(configs)} vmess configs. Running TCP latency test...")
+    cached = _load_cache(args.sub)
+    if cached:
+        best, age = cached
+        print(f"  Using cached config from {age}s ago (within {CACHE_TTL}s window), skipping latency checks.")
+        print(f"  Config: {best['name']}  ({best['server']}:{best['port']})")
+    else:
+        best = None
 
-    # ---- TCP filter ----
-    tcp_results: list = []
-    with ThreadPoolExecutor(max_workers=50) as ex:
-        futs = {ex.submit(tcp_latency, cfg): cfg for cfg in configs}
-        for fut in as_completed(futs):
-            lat = fut.result()
-            if lat is not None:
-                tcp_results.append((lat, futs[fut]))
+    if best is None:
+        print(f"Found {len(configs)} vmess configs. Running TCP latency test...")
 
-    tcp_results.sort(key=lambda x: x[0])
-    top_n = max(args.top, 15)
-    candidates = [cfg for _, cfg in tcp_results[:top_n]]
+        # ---- TCP filter ----
+        tcp_results: list = []
+        with ThreadPoolExecutor(max_workers=50) as ex:
+            futs = {ex.submit(tcp_latency, cfg): cfg for cfg in configs}
+            for fut in as_completed(futs):
+                lat = fut.result()
+                if lat is not None:
+                    tcp_results.append((lat, futs[fut]))
 
-    if not candidates:
-        print("All servers unreachable. Check your network connection.")
-        sys.exit(1)
+        tcp_results.sort(key=lambda x: x[0])
+        top_n = max(args.top, 15)
+        candidates = [cfg for _, cfg in tcp_results[:top_n]]
 
-    print(f"{len(tcp_results)}/{len(configs)} servers reachable. HTTP-testing top {len(candidates)}...")
+        if not candidates:
+            print("All servers unreachable. Check your network connection.")
+            sys.exit(1)
 
-    # ---- HTTP test via sing-box ----
-    http_results: list = []
-    done = 0
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        futs = {ex.submit(http_latency, cfg): cfg for cfg in candidates}
-        for fut in as_completed(futs):
-            cfg = futs[fut]
-            lat = fut.result()
-            done += 1
-            tag = f"{cfg['server']}:{cfg['port']}"
-            if lat is not None:
-                http_results.append((lat, cfg))
-                print(f"  [{done:2d}/{len(candidates)}] {tag:<40} {int(lat * 1000)}ms")
-            else:
-                print(f"  [{done:2d}/{len(candidates)}] {tag:<40} failed")
+        print(f"{len(tcp_results)}/{len(configs)} servers reachable. HTTP-testing top {len(candidates)}...")
 
-    if not http_results:
-        print("\nNo configs passed the HTTP test. The subscription may be stale.")
-        sys.exit(1)
+        # ---- HTTP test via sing-box ----
+        http_results: list = []
+        done = 0
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            futs = {ex.submit(http_latency, cfg): cfg for cfg in candidates}
+            for fut in as_completed(futs):
+                cfg = futs[fut]
+                lat = fut.result()
+                done += 1
+                tag = f"{cfg['server']}:{cfg['port']}"
+                if lat is not None:
+                    http_results.append((lat, cfg))
+                    print(f"  [{done:2d}/{len(candidates)}] {tag:<40} {int(lat * 1000)}ms")
+                else:
+                    print(f"  [{done:2d}/{len(candidates)}] {tag:<40} failed")
 
-    http_results.sort(key=lambda x: x[0])
-    best_lat, best = http_results[0]
-    print(f"\n✓ Best: {best['name']}  ({best['server']}:{best['port']})  {int(best_lat * 1000)}ms")
+        if not http_results:
+            print("\nNo configs passed the HTTP test. The subscription may be stale.")
+            sys.exit(1)
+
+        http_results.sort(key=lambda x: x[0])
+        best_lat, best = http_results[0]
+        print(f"\n✓ Best: {best['name']}  ({best['server']}:{best['port']})  {int(best_lat * 1000)}ms")
+        _save_cache(args.sub, best)
 
     # ---- Start production proxy ----
     cfg_path = SINGBOX_DIR / "config.json"
@@ -493,18 +528,29 @@ def main():
         stderr=subprocess.DEVNULL,
     )
 
-    def _stop(*_):
-        proc.terminate()
+    _stop_called = False
+
+    def _stop():
+        nonlocal _stop_called
+        if _stop_called:
+            return
+        _stop_called = True
         try:
+            proc.terminate()
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
+        except ProcessLookupError:
+            pass
         print("\nProxy stopped.")
-        sys.exit(0)
+
+    def _signal_stop(*_):
+        _stop()
+        os._exit(0)
 
     atexit.register(_stop)
-    signal.signal(signal.SIGINT, _stop)
-    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _signal_stop)
+    signal.signal(signal.SIGTERM, _signal_stop)
 
     print(f"Starting proxy on 0.0.0.0:{args.port} ...")
     if not _wait_port("127.0.0.1", args.port, timeout=6.0):
