@@ -118,6 +118,20 @@ def ensure_singbox():
         _download_singbox()
     else:
         _strip_quarantine(SINGBOX_BIN)
+    _verify_singbox()
+
+
+def _verify_singbox():
+    result = subprocess.run(
+        [str(SINGBOX_BIN), "version"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        msg = (result.stderr or result.stdout).strip()
+        print(f"sing-box binary check failed:\n  {msg}")
+        print(f"\nTry removing and re-running to re-download:")
+        print(f"  rm {SINGBOX_BIN}")
+        sys.exit(1)
 
 
 def _load_cache(sub_url: str) -> tuple[dict, int] | None:
